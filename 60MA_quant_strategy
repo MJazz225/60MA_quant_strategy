@@ -1,0 +1,198 @@
+#########################################################################
+#
+# made by Marshaw
+#
+# excel的起始日期是1899-12-30
+#
+# 开始日期：15-02-2024
+# 量化交易策略
+# 从MA开始，测试60MA右侧策略
+#
+#######################################################################
+
+rm(list=ls())
+
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library(tidyr)
+if (!requireNamespace("zoo")){install.packages("zoo")}
+library(zoo)
+####################################################################################################################################################################################
+initial_margin <- 10000
+trading_volume <- 1 #以USDT为基准
+MA_size <- 60 
+
+####################################################################################################################################################################################
+rawdata <- read.csv('Downloads/UNIUSDT_Binance_futures_UM_hour.csv', sep = ',', header = T, skip = 1)
+rawdata <- rawdata[nrow(rawdata):1,]
+data1 <- rawdata[rawdata$Date > '2022-01-01 00:00:00',]
+#data1 <- rawdata
+data1 <- data1[,c(1,2,3,7)]
+# 计算 rolling window 的平均值
+rolling_mean <- rollapply(data1[,4] %>% as.numeric(), width = MA_size, FUN = mean, align = "right", fill = NA) %>% as.data.frame()
+colnames(rolling_mean) <- "MA"
+data1 <- cbind(data1, rolling_mean)
+data1 <- na.omit(data1)
+data1 <- data1 %>% mutate(close_MA_diff = round(data1[,4] - data1[,5],4))
+MA_close_diff_percent <- (data1[,6]/data1[,5]) %>% round(4) %>% as.data.frame()
+colnames(MA_close_diff_percent) <- 'MA_close_diff_percent'
+data1 <- cbind(data1, MA_close_diff_percent)
+
+#data1 <- data1 %>% mutate(entry = data[,6]>150)
+close_return <- diff(log(data1$Close)) %>% round(4) %>% as.data.frame()
+colnames(close_return) <- 'close_return'
+data1 <- data1[2:nrow(data1),]
+data1 <- cbind(data1, close_return)
+
+#回圈跑策略总结
+result_strategy <- data.frame()
+for (i in 1:20) {
+  cat(i, '%','\n')
+  
+  #进场策略
+  n=i/100
+  data2 <- data1 %>% mutate(entry_0.02 = MA_close_diff_percent>n)
+  data2[,9] <- as.numeric(data2[,9])
+  
+  # Return and Cumsum
+  return <- with(data2[-nrow(data2), ], {
+    round(as.numeric(data2[,9] * (data2[,4] / lag(data2[,4]) - 1)), 5)
+  }) %>% as.data.frame()
+  return <- na.omit(return)
+  cumsum1 <- cumsum(return)
+  colnames(return) <- 'Return'
+  colnames(cumsum1) <- 'Cumsum'
+  data2 <- data2[1:(nrow(data2)-1),]
+  data2 <- cbind(data2, return, cumsum1)
+  
+  #Sharpe Ratio
+  hours_per_year <- 365*24
+  sharpe_ratio <- (mean(data2$Return)*hours_per_year)/(sd(data2$Return)*sqrt(365)) %>% as.data.frame() 
+  sharpe_ratio1 <- (mean(data2$Return))/(sd(data2$Return)*sqrt(365)) %>% as.data.frame()
+  colnames(sharpe_ratio) <- 'Sharpe Ratio'
+  colnames(sharpe_ratio1) <- 'Sharpe Ratio1'
+  
+  #总结
+  tem <- cbind(n,data2[nrow(data2),ncol(data2)],sharpe_ratio,sharpe_ratio1)
+  result_strategy <- rbind(result_strategy, tem)
+}
+colnames(result_strategy) <- c('进场参数','累计报酬率', 'Sharpe Ratio', 'Sharpe Ratio1')
+#上面回圈太慢，看能不能优化
+'# 假设你要按照 group_column 列进行分组，计算 tem 列的累计和
+result <- data2 %>%
+  group_by(group_column) %>%
+  mutate(tem_cumsum = cumsum((lag(data2[,4]) * data2[,9]) / lead(data1[,4]) - 1))'
+
+
+##########################################   test   ####################################################################################################
+
+#进场策略
+i=1
+n=i/100
+m=n*-1
+testdata <- data1 %>% mutate(entry = MA_close_diff_percent>n)
+tem <- ifelse(MA_close_diff_percent<m,-1,0)
+tem <- tem[2:nrow(tem),] %>% as.data.frame()
+colnames(tem) <- 'exit'
+testdata <- cbind(testdata, tem)
+testdata$entry <- as.numeric(testdata$entry)
+
+# 假设你的数据框为 data，包含 entry、exit 和 price 字段
+# 创建一个新的列表示持有标志，1表示持有，0表示不持有
+testdata$holding <- cumsum(testdata$entry) + cumsum(testdata$exit)
+
+#仓位和盈余结算
+holding_btc <- ifelse(testdata$entry == 1, cumsum(testdata$entry*trading_volume), NA) %>% as.data.frame()
+holding_btc <- na.locf(holding_btc)
+
+testdata$lag_holding <- lag(testdata$holding)
+testdata$lag_holding[is.na(testdata$lag_holding)] <- 0
+account_money <- NULL
+account_money2 <- NULL
+tem_data <- NULL
+tem_btc <- 0
+money <- initial_margin
+btc <- 0
+for (i in 1:(nrow(testdata)-1)) {
+  cat(i,'/', nrow(testdata)-1,'\n')
+  
+  tem_money <- money
+  if (testdata[i,'lag_holding'] < testdata[i,'holding']) {
+    tem <- tem_money - testdata[i,'Close']*trading_volume
+    tem_btc <- btc + trading_volume
+    money <- tem
+    if (testdata[i,'lag_holding'] > testdata[i,'holding']) { ##卖出油问题，得不出结果
+      tem <- tem_money + as.numeric(testdata[i,'Close'])*trading_volume
+      tem_btc <- btc - trading_volume
+      money <- tem
+      if(testdata[i,'lag_holding'] == testdata[i,'holding']){
+        tem_money <- money
+        tem_btc <- btc
+        money <- tem
+      }  
+    }
+  }    
+  tem_data <- rbind(tem_data, tem_btc)
+  account_money <- rbind(account_money, money)
+}
+account_money <- rbind(account_money, account_money[nrow(account_money),]) %>% as.data.frame()
+buyin_money <- account_money
+
+money <- 0
+account_money <- NULL
+account_money2 <- NULL
+tem_data <- NULL
+btc <- 0
+for (i in 1:(nrow(testdata))) {
+  cat(i,'/', nrow(testdata),'\n')
+  
+  tem_money <- money
+      if (testdata[i,'lag_holding'] > testdata[i,'holding']) {
+      tem_money <- money
+      tem <- tem_money + testdata[i,'Close']*trading_volume
+      tem_btc <- btc - trading_volume
+      money <- tem
+
+  }    
+  tem_data <- rbind(tem_data, tem_btc)
+  account_money <- rbind(account_money, money)
+}
+close_money <- account_money
+rm(account_money)
+account_money <- buyin_money[,1]+close_money[,1] %>% as.data.frame()
+colnames(account_money) <- 'account_money'
+testdata <- cbind(testdata, account_money)
+
+trade_data <- testdata[testdata$account_money>0,] 
+buy_data <- trade_data[trade_data$entry==1,]
+sell_data <- trade_data[trade_data$exit==-1,]
+floating_data <- NULL ##买量-卖量剩下的都是持仓记录
+if (nrow(buy_data)>nrow(sell_data)) {
+  floating_data <- buy_data[(nrow(sell_data)+1):nrow(buy_data),] ##买量-卖量剩下的都是持仓记录
+}else{
+  floating_data <- buy_data[nrow(buy_data),] ##买量-卖量剩下的都是持仓记录
+  
+}
+##statistic
+avg_float_price <- mean(floating_data$Close) 
+floating_volume <- nrow(floating_data)*trading_volume
+floating_value <- floating_volume*trade_data[nrow(trade_data),4]
+total_gain <- floating_volume*trade_data[nrow(trade_data),4]-mean(floating_data$Close)*floating_volume
+start_time <- trade_data[1,2]
+end_time <- trade_data[nrow(trade_data),2]
+profit_percent <- paste0(round(((floating_value+total_gain-initial_margin)/initial_margin)*100,3), '%')
+
+statistic_data <- cbind(avg_float_price, floating_volume, initial_margin, trading_volume, floating_value, total_gain, profit_percent, trade_data[1,2], trade_data[nrow(trade_data),2])
+colnames(statistic_data) <- c('平均买价', '持仓量', '起始资金', '每次买量', '持仓价值', '浮动盈亏', '获利率', '开始交易时间','最后交易时间')
+result_strategy
+t(statistic_data)
+################# test #################
+
+
+
+
+
+  
+  
+  
